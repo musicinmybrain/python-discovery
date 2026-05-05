@@ -65,6 +65,106 @@ detects these shims and resolves them to the actual binary.
 `mise <https://mise.jdx.dev/>`_ and `asdf <https://asdf-vm.com/>`_ work similarly, using the
 ``MISE_DATA_DIR`` and ``ASDF_DATA_DIR`` environment variables to locate their installations.
 
+How uv-managed Pythons are discovered
+---------------------------------------
+
+`uv <https://docs.astral.sh/uv/>`_ installs Python interpreters under a single root directory (configurable via
+``UV_PYTHON_INSTALL_DIR``, otherwise defaulting under ``XDG_DATA_HOME`` or the platform user-data path). Each
+install lives in its own subdirectory, but the actual binary location varies by OS and implementation:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 35 40
+
+   * - Implementation
+     - Unix layout
+     - Windows layout
+   * - CPython
+     - ``<root>/<key>/bin/python``
+     - ``<root>/<key>/python.exe``
+   * - PyPy
+     - ``<root>/<key>/bin/pypy*``
+     - ``<root>/<key>/pypy*.exe``
+   * - GraalPy
+     - ``<root>/<key>/bin/graalpy``
+     - ``<root>/<key>/bin/graalpy.exe``
+
+.. mermaid::
+
+    flowchart LR
+        Call(["iter_interpreters(key)"]) --> Mode{"key is None?"}
+        Mode -->|"narrow"| N1["*/bin/python"]
+        Mode -->|"narrow"| N2["*/python.exe"]
+        Mode -->|"wide"| W1["*/bin/pypy*"]
+        Mode -->|"wide"| W2["*/bin/graalpy"]
+        Mode -->|"wide"| W3["*/pypy*.exe"]
+        Mode -->|"wide"| W4["*/bin/graalpy.exe"]
+
+        N1 --> Dedup[/"realpath dedup"/]
+        N2 --> Dedup
+        W1 --> Dedup
+        W2 --> Dedup
+        W3 --> Dedup
+        W4 --> Dedup
+
+        Dedup --> Interrogate(["subprocess interrogation"])
+
+        style Call fill:#4a90d9,stroke:#2a5f8f,color:#fff
+        style Mode fill:#d9904a,stroke:#8f5f2a,color:#fff
+        style N1 fill:#3a7fc2,stroke:#1f4d7a,color:#fff
+        style N2 fill:#3a7fc2,stroke:#1f4d7a,color:#fff
+        style W1 fill:#9f4ad9,stroke:#5f2a8f,color:#fff
+        style W2 fill:#9f4ad9,stroke:#5f2a8f,color:#fff
+        style W3 fill:#9f4ad9,stroke:#5f2a8f,color:#fff
+        style W4 fill:#9f4ad9,stroke:#5f2a8f,color:#fff
+        style Dedup fill:#c2873a,stroke:#7a4c1f,color:#fff
+        style Interrogate fill:#4a9f4a,stroke:#2a6f2a,color:#fff
+
+GraalPy keeps its ``bin/`` segment on Windows (an upstream choice in uv); PyPy and CPython do not. python-discovery
+globs all of these patterns regardless of the host OS, because globs that do not match anything are essentially
+free, and the cross-platform list is short. Symlinked aliases inside an install (``bin/python``,
+``bin/python3``, ``bin/python3.14`` all pointing at the same real file) are deduplicated by resolved path before
+the subprocess interrogation, so each install is interrogated once.
+
+Selecting one interpreter vs. enumerating all of them
+-------------------------------------------------------
+
+:func:`~python_discovery.get_interpreter` and :func:`~python_discovery.iter_interpreters` walk the same candidate
+sources, but they answer different questions and behave differently in three ways.
+
+.. mermaid::
+
+    flowchart LR
+        Sources["candidate sources<br>(try_first_with → current →<br>PEP 514 → PATH → uv)"]
+        Sources --> Get["get_interpreter()<br>first match wins, returns one"]
+        Sources --> Iter["iter_interpreters()<br>yields every match"]
+
+        style Get fill:#4a9f4a,stroke:#2a6f2a,color:#fff
+        style Iter fill:#4a90d9,stroke:#2a5f8f,color:#fff
+
+**Implementation coverage on PATH.** :func:`~python_discovery.get_interpreter` matches only ``python*`` filenames on
+PATH unless the spec names another implementation explicitly (``pypy3.12``, ``graalpy3.11``). This keeps backwards
+compatibility with tools that have always read "no implementation in the spec" as "give me CPython."
+:func:`~python_discovery.iter_interpreters` with no spec broadens the search to every name in
+:data:`~python_discovery.KNOWN_IMPLEMENTATIONS` -- otherwise an "all interpreters" call would silently miss every
+PyPy and GraalPy on the system. When you pass a spec to :func:`~python_discovery.iter_interpreters`, it falls back
+to the same narrow regex as :func:`~python_discovery.get_interpreter`, so behavior is consistent across the two
+APIs whenever a spec is given.
+
+**Deduplication.** :func:`~python_discovery.get_interpreter` deduplicates per call so it does not interrogate the
+same binary twice while searching, and stops as soon as a match is found. :func:`~python_discovery.iter_interpreters`
+deduplicates by the resolved real path of each candidate's ``system_executable`` (falling back to ``executable``).
+That means symlinked aliases like ``/bin/python3`` and ``/usr/bin/python3``, or a virtualenv whose ``python``
+symlinks to its base interpreter, collapse to a single yield. The semantic is "one entry per distinct install,"
+which is what callers building choosers or version-range pickers usually want.
+
+**Iteration order.** Yields come back in *priority order*: ``try_first_with`` first, then the running interpreter,
+then :pep:`514` entries on Windows, then PATH left-to-right, then UV-managed installs. This matches what
+:func:`~python_discovery.get_interpreter` would have returned at each step. If your ordering differs (newest
+version first, smallest install root, etc.), wrap the call in :func:`sorted` -- the API deliberately does not
+include a ``sort_by`` parameter because keeping discovery order preserves the priority signal for callers who
+want it.
+
 How caching works
 -------------------
 
@@ -165,9 +265,12 @@ A spec string follows the pattern ``[impl][version][t][-arch][-machine]``. Every
    * - ``/usr/bin/python3``
      - Absolute path, used directly (no search)
    * - ``>=3.11,<3.13``
-     - :pep:`440` version specifier (any Python in range)
+     - `Version specifier <https://packaging.python.org/en/latest/specifications/version-specifiers/>`_
+       (any Python in range)
    * - ``cpython>=3.11``
-     - :pep:`440` specifier restricted to CPython
+     - `Version specifier <https://packaging.python.org/en/latest/specifications/version-specifiers/>`_
+       restricted to CPython
 
-:pep:`440` specifiers (``>=``, ``<=``, ``~=``, ``!=``, ``==``, ``===``) are supported. Multiple
-specifiers can be comma-separated, for example ``>=3.11,<3.13``.
+`Version specifiers <https://packaging.python.org/en/latest/specifications/version-specifiers/>`_
+(``>=``, ``<=``, ``~=``, ``!=``, ``==``, ``===``) are supported. Multiple specifiers can be comma-separated,
+for example ``>=3.11,<3.13``.
